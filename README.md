@@ -16,3 +16,11 @@ To enhance predictive accuracy, we selected key features such as Role, Overtime,
 
 ## Conclusion and Recommendations: 
 The analysis points to specific areas of opportunity to improve retention, especially within the Sales department and for employees frequently working overtime. Implementing strategies to balance workload and provide career development opportunities may help mitigate attrition. By leveraging these insights, DDSAnalytics can make data-driven decisions to foster a more stable and engaged workforce.
+
+
+
+## Presentation
+
+# Video
+https://smu-2u-com.zoom.us/rec/share/28GW9Im-yTCq7Qwd8Z7FdYP-5dI7oxUcbcBDkbi75epi1X4hDQDTpJ87t-Fgr7Rx.gPDpSvJNHJNvV7UU 
+Passcode: O)qVV8#w
