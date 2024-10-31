@@ -655,4 +655,9 @@ write.csv(case_one_predict, "Case1PredictionsMiguelZavala_Attrition.csv", row.na
 ```
 
 
+# Final Presentation
+https://github.com/mikkezavala/CaseStudy1DDS/tree/main
 
+# Video
+https://smu-2u-com.zoom.us/rec/share/28GW9Im-yTCq7Qwd8Z7FdYP-5dI7oxUcbcBDkbi75epi1X4hDQDTpJ87t-Fgr7Rx.gPDpSvJNHJNvV7UU 
+Passcode: O)qVV8#w
