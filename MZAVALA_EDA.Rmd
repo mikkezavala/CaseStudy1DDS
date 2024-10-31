@@ -1,0 +1,658 @@
+---
+title: "DDS-6306 Employee Attrition EDA"
+author: "Miguel Zavala"
+date: "2024-10-21"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 4
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+---
+
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# options(repos = c(CRAN = "https://cran.rstudio.com/"))
+# install.packages('reshape2')
+# install.packages("class")
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(reshape2)
+library(corrplot)
+library(patchwork)
+library(fastDummies)
+library(scales)
+library(colorspace)
+
+# Training Libs
+library(kknn)
+library(caret)
+library(e1071)
+library(class)
+library(vcd)
+library(reactable)
+```
+
+# Employee attrition
+
+## Loading Data
+
+Load the data and do a quick inspect
+
+```{r}
+# attritionData = read.csv(file.choose())
+attritionData = read.csv("./CaseStudy1-data.csv")
+
+sprintf("Data composed of: %d rows and %d columns", nrow(attritionData), ncol(attritionData))
+head(attritionData, n = 5)
+# tail(attritionData)
+```
+
+## Verify data integrity and
+
+Observe the data for any nullity and let's fix the columns that require to be factors. We are removing other variables that single value, those variables we cannot use them for now as predictors
+
+```{r}
+emptyData =  colSums(is.na(attritionData))
+tibble(Column = names(emptyData), `Num Rows` = emptyData)
+
+
+# Filter columns (variables we wont contribute to predictors)
+attritionData = attritionData %>% select(-ID, -EmployeeCount, -StandardHours, -Over18, -EmployeeNumber)
+# Factor Attrition
+attritionData$Attrition = as.factor(attritionData$Attrition)
+# Atrition as Numeric
+attritionData$AttritionWeight = ifelse(attritionData$Attrition == "Yes", 1, 0)
+```
+
+## Examine Variables of Interest
+
+```{r}
+nObservations = nrow(attritionData)
+attritionRate = table(attritionData$Attrition) / nObservations
+sprintf(
+  "From %d employees, %.2f%% left the company and %.2f%% stayed",
+  nObservations,
+  attritionRate[[2]] * 100,
+  attritionRate[[1]] * 100
+)
+```
+
+### Look for correlation with attrition
+
+####
+```{r}
+# One-hot encode categorical variables (excluding Attrition itself)
+encodeAttrition = attritionData %>%
+  fastDummies::dummy_cols(remove_first_dummy = TRUE,
+                          remove_selected_columns = TRUE)
+
+# Correlation Runner Up's
+selected_data <- attritionData[, c(
+  "YearsAtCompany",
+  "TotalWorkingYears",
+  "YearsWithCurrManager",
+  "YearsSinceLastPromotion",
+  "WorkLifeBalance",
+  "JobSatisfaction"
+)]
+
+corr_matrix <- cor(selected_data, use = "complete.obs")
+ggplot(data = melted_corr, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#fee08b",
+    mid = "#fdae61",
+    high = "#b2182b",
+    midpoint = 0,
+    limit = c(-1, 1)
+  ) +
+  coord_fixed() +
+  scale_x_discrete(position = "top") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.location = "panel",
+    legend.key.width = unit(2, "cm")
+  ) +
+  labs(x = "", y = "")
+```
+
+#### Looking for patterns in data that gives tendency to attrition.
+
+```{r}
+# Remove self-correlation
+as.data.frame(as.table(corrMatrix)) %>% filter(Var1 != "AttritionWeight")  %>%
+  ggplot(aes(Var1, Var2, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = round(Freq, 2)),
+    color = "black",
+    angle = 90,
+    size = 5
+  ) +
+  coord_fixed(ratio = 7) +
+  scale_fill_gradient2(
+    low = "#d73027",
+    high = "#17c3b2",
+    mid = "#ffffff",
+    midpoint = 0,
+    name = "Correlation",
+    limit = c(-1, 1)
+  ) +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    vjust = 0.5,
+    size = 14,
+    hjust = 1,
+    margin = margin(
+      t = 5,
+      b = 0,
+      l = 10
+    ),
+  )) +
+  labs(
+  title = waiver(),
+  subtitle = waiver(),
+  x = "",
+  y = ""
+)
+  
+```
+
+Once we have ordered our variables in relation of attrition, we can clearly see both extremes where the data can be predicted, let's start with with scrambling variables and combining them (sort of recursive feature selection), and computing the precision number.
+
+Ideally from here we get an idea what variables can predict best, as we saw in the data set we spotted some imbalance, we are running 5000 samples of label scrambling, selecting the groups that output, good sensitivity and specificity.
+
+We already have from the correlation plot above the trend against attrition and the one favor attritions, this permutations, scrambling is a an exercise to explore accuracy with other features.
+
+```{r}
+library(furrr)
+library(parallel)
+
+
+n_cores <- detectCores()
+n_cores
+
+plan(multisession, workers = n_cores - 1)
+
+
+buildFeatures = function(trainData, testData) {
+  trainData = trainData %>% mutate_if(is.character, as.factor)
+  testData = testData %>% mutate_if(is.character, as.factor)
+  
+  # Ensure testData has the same factor levels as trainData for each factor column
+  for (col in colnames(trainData)) {
+    if (is.factor(trainData[[col]])) {
+      testData[[col]] = factor(testData[[col]], levels = levels(trainData[[col]]))
+    }
+  }
+  
+  # One-hot encoding for categorical variables
+  trainEncode = model.matrix(~ . - 1, data = trainData)
+  trainDencode = model.matrix(~ . - 1, data = testData)
+  
+  return(
+    list(
+      trainEncode = trainEncode,
+      trainDencode = trainDencode,
+      trainData = trainData,
+      testData = testData
+    )
+  )
+}
+
+# Function to evaluate Naive Bayes and KNN models
+evaluateModels = function(features,
+                          target,
+                          k = 5,
+                          threshold = 0.3) {
+  # Train/Test Split
+  trainIndex = createDataPartition(attritionData[[target]], p = 0.7, list = FALSE)
+  trainData = attritionData[trainIndex, ]
+  testData = attritionData[-trainIndex, ]
+  
+  splitFeatures = buildFeatures(trainData, testData)
+  
+  trainEncode = splitFeatures$trainEncode
+  trainDencode = splitFeatures$trainDencode
+  
+  trainData = splitFeatures$trainData
+  testData = splitFeatures$testData
+  
+  # Select features
+  trainLabels = trainData[[target]]
+  testLabels = testData[[target]]
+  
+  # KNN Model
+  knnModel = knn(trainEncode,
+                 trainDencode,
+                 trainLabels,
+                 k = k,
+                 prob = TRUE)
+  
+  # Imbalance adjust
+  knnProbs = ifelse(knnModel == "Yes",
+                    attributes(knnModel)$prob,
+                    1 - attributes(knnModel)$prob)
+  
+  knnAdjustedPredictions = ifelse(knnProbs > threshold, "Yes", "No")
+  
+  knnMatrix = confusionMatrix(factor(knnAdjustedPredictions), testLabels, mode = "everything")
+  knnAccuracy = knnMatrix$overall["Accuracy"]
+  knnSensitivity = knnMatrix$byClass["Sensitivity"]
+  knnSpecificity = knnMatrix$byClass["Specificity"]
+  knnF1 = knnMatrix$byClass["F1"]
+  
+  # Naive Bayes Model
+  nbModel = naiveBayes(as.formula(paste(
+    target, "~", paste(features, collapse = " + ")
+  )), data = trainData)
+  
+  nbPredictions = predict(nbModel, testData)
+  nbProbs = predict(nbModel, testData, type = "raw")[, "Yes"]
+  nbAdjustedPredictions = ifelse(nbProbs >= threshold, "Yes", "No")
+  
+  nbMatrix = confusionMatrix(factor(nbAdjustedPredictions), testLabels, mode = "everything")
+  nbMatrix
+  
+  nbAccuracy = nbMatrix$overall["Accuracy"]
+  nbSensitivity = nbMatrix$byClass["Sensitivity"]
+  nbSpecificity = nbMatrix$byClass["Specificity"]
+  nbF1 = nbMatrix$byClass["F1"]
+  
+  return(
+    list(
+      nbAccuracy = nbAccuracy,
+      nbSensitivity = nbSensitivity,
+      nbSpecificity = nbSpecificity,
+      nbF1 = nbF1,
+      knnAccuracy = knnAccuracy,
+      knnSensitivity = knnSensitivity,
+      knnSpecificity = knnSpecificity,
+      knnF1 = knnF1,
+      naive_bayes_model = nbModel
+    )
+  )
+}
+
+scrambleFeatures = function(iterations = 10,
+                             target,
+                             k = 5,
+                             threshold = 0.3,
+                             minTolerance = 0.55) {
+  results = data.frame()
+  all_features = colnames(attritionData)[!colnames(attritionData) %in% c(target, "AttritionWeight")]  
+  
+  p <- progressr::progressor(along = 1:iterations)
+
+  results <- future_map_dfr(1:iterations, ~{
+    p()
+  # for (i in 1:iterations) %dopar%  {
+    set.seed(.x)
+
+    # random_features = sample(all_features, sample(3:7, 1))
+    random_features = c(
+      "Age",
+      "JobRole",
+      "OverTime",
+      "MaritalStatus",
+      "JobInvolvement",
+      "TotalWorkingYears",
+      "DistanceFromHome"
+    )
+    
+    result = evaluateModels(random_features, target, k, threshold)
+    
+    nb_accuracy = as.numeric(result$nbAccuracy)
+    knn_accuracy = as.numeric(result$knnAccuracy)
+    nb_sensitivity = as.numeric(result$nbSensitivity)
+    knn_sensitivity = as.numeric(result$knnSensitivity)
+    nb_specificity = as.numeric(result$nbSpecificity)
+    knn_specificity = as.numeric(result$knnSpecificity)
+    
+    # Willing to loose 5% accuracy for sensitivity and specificity
+    if ((
+      nb_sensitivity > minTolerance &
+      nb_specificity > minTolerance &
+      nb_accuracy > (minTolerance - .05)
+    ) |
+    (knn_sensitivity > minTolerance &
+     knn_specificity > minTolerance) &
+    knn_accuracy > (minTolerance - .05)) {
+      results = rbind(
+        results,
+        data.frame(
+          features = paste(random_features, collapse = ", "),
+          nb_accuracy = nb_accuracy,
+          nb_sensitivity = nb_sensitivity,
+          nb_specificity = nb_specificity,
+          knn_accuracy = knn_accuracy,
+          knn_sensitivity = knn_sensitivity,
+          knn_specificity = knn_specificity,
+          nb_f1 = as.numeric(result$nbF1),
+          knn_f1 = as.numeric(result$knnF1),
+          iteration = .x
+        )
+      )
+    }
+  })
+  
+  plan(sequential)
+
+  return(results)
+}
+
+progressr::with_progress({
+  # Running the feature scramble with a set number of iterations
+  results = scrambleFeatures(
+    k = 30,
+    threshold = 0.14,
+    iterations = 5000,
+    minTolerance = 0.75,
+    target = "Attrition" 
+  )
+})
+
+
+# Display the top results
+top_results = results %>% arrange(desc(knn_sensitivity), desc(knn_specificity))
+
+top_results$bestOveralNB = top_results$nb_sensitivity + top_results$nb_specificity + top_results$nb_accuracy
+top_results$bestOveralKNN = top_results$knn_sensitivity + top_results$knn_specificity + top_results$knn_accuracy
+
+topNB = top_results %>% arrange(desc(bestOveralNB)) %>% head(5)
+topKNN = top_results %>% arrange(desc(bestOveralKNN)) %>% head(5)
+
+# Print the result
+topNB %>% select(features,
+                 nb_sensitivity,
+                 nb_specificity,
+                 nb_accuracy,
+                 bestOveralNB, iteration) %>% print()
+topKNN %>% select(features,
+                  knn_sensitivity,
+                  knn_specificity,
+                  knn_accuracy,
+                  bestOveralKNN) %>% print()
+
+# Best result was on seed 2084, k = 30 and features: 
+# JobInvolvement, Age, MaritalStatus, YearsWithCurrManager, MonthlyIncome, OverTime | nbSensitivity: 0.8127854 | nbSpecificity: 0.7857143 | nbAccuracy: 0.8084291
+# OverTime, JobRole, WorkLifeBalance, Age, RelationshipSatisfaction, JobInvolvement	
+```
+
+```{r}
+higherAttrition = head(corrMatrix, 5)
+lowerAttrition = tail(corrMatrix, 5)
+```
+
+### Exploring variables associated to direct/indirect monetary compensation
+
+```{r}
+catVariables = attritionData[, c("JobRole", "OverTime", "MaritalStatus", "Attrition")]
+contVariables = attritionData[, c("Age",
+                                  "DistanceFromHome",
+                                  "TotalWorkingYears",
+                                  "JobInvolvement",
+                                  "Attrition")]
+
+formattedLabels <- c(
+  Age = "Age (Years)",
+  TotalWorkingYears = "Total Working (Years)",
+  JobInvolvement = "Job Involvement Level (Rating)",
+  DistanceFromHome = "Distance from Home (Miles)"
+)
+
+melt(contVariables, id.vars = "Attrition") %>% ggplot(aes(x = value, fill = Attrition)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(
+    ~ variable,
+    scales = "free",
+    ncol = 2,
+    labeller = labeller(variable = formattedLabels)
+  ) +
+  ggtitle("Age, Total Working Years, Job Involvement - Attrition") +
+  xlab("") +
+  ylab("Density")
+
+# Plot 2: Categorical variables using bar plots
+melt(catVariables, id.vars = "Attrition") %>% ggplot(aes(x = value, fill = Attrition)) +
+  geom_bar(position = "fill", alpha = 0.7) +
+  facet_wrap( ~ variable, scales = "free", ncol = 3) +
+  ggtitle("Job Role, Overtime and Marital Status - Attrition") +
+  xlab("Category") +
+  ylab("Proportion") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+### Attrition by Department
+
+```{r}
+attritionByDepartment = attritionData %>% group_by(Department) %>%
+  summarise(AttritionRate = mean(Attrition == "Yes")) %>% arrange(AttritionRate)
+
+attritionByDepartment$Department = recode(
+  attritionByDepartment$Department,
+  "Human Resources" = "HR",
+  "Research & Development" = "R & D"
+)
+attritionByDepartment$Department = factor(attritionByDepartment$Department, levels = attritionByDepartment$Department)
+
+
+attritionByDepartment %>% ggplot(aes(x = Department, y = AttritionRate, fill = Department)) +
+  geom_bar(stat = "identity") +
+    geom_text(
+    aes(label = percent(AttritionRate, accuracy = 0.01)),
+    vjust = 2.5,
+    color = "black",
+    size = 4
+  ) +
+  ggtitle("Attrition Rate by Department") +
+  ylab("Rate") +
+  xlab("") +
+  scale_fill_brewer(palette = "PuRd") +
+  theme(axis.text.x = element_text(margin = margin(t = 10, b = 15)),
+        axis.text.y = element_text(margin = margin(r = 10, l = 15)),
+  )
+```
+
+### Attrition by Role
+
+```{r}
+attritionByRole = attritionData %>% group_by(JobRole) %>%
+  summarise(AttritionRate = mean(Attrition == "Yes")) %>% arrange(AttritionRate)
+attritionByRole$JobRole = factor(attritionByRole$JobRole, levels = attritionByRole$JobRole)
+
+attritionByRole %>% 
+  ggplot(aes(x = JobRole, y = AttritionRate, fill = JobRole)) +
+  geom_bar(stat = "identity", width = 0.45) +
+  geom_text(
+    aes(label = percent(AttritionRate, accuracy = 0.01)),
+    vjust = -0.975,
+    hjust = 0.975,
+    color = "black",
+  ) +
+  ggtitle("Attrition Rate by Job Role") +
+  ylab("Rate") +
+  xlab("Role") +
+  theme(
+    axis.text.x = element_text(), 
+    legend.position = "none", 
+  ) +
+  scale_fill_brewer(palette = "RdPu") +
+  coord_flip()
+```
+
+### 
+
+```{r}
+attritionData %>%
+  ggplot(aes(x = JobRole, fill = Attrition)) +
+  geom_bar(position = "fill", width = 0.7) +
+  facet_wrap( ~ Department, scales = "free_x") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("#17c3b2", "#ffcb77")) +
+  labs(title = "Attrition by Job Role and Department",
+       y = "Attrition (Percentage)",
+       x = "Job Role",
+       fill = "Attrition") +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      size = 10
+    ),
+    axis.text.y = element_text(size = 10),
+    plot.margin = margin(10, 10, 10, 10),
+    legend.position = "none"
+  ) +
+  coord_flip()
+```
+
+### Job Satisfaction
+
+```{r}
+ggplot(
+  melt(attritionData[, c("Age", "JobInvolvement", "TotalWorkingYears", "Attrition")], id.vars = "Attrition"),
+  aes(x = Attrition, y = value, fill = Attrition)
+) +
+  geom_boxplot() +
+  facet_wrap( ~ variable, scales = "free") +
+  ggtitle("Boxplots of Continuous Variables by Attrition") +
+  xlab("Attrition") +
+  ylab("Value")
+```
+
+```{r}
+mosaic(~ OverTime + MaritalStatus + Attrition, data = attritionData, 
+       highlighting = "Attrition", 
+       highlighting_fill = c("#feebe2", "#fbb4b9"),
+       direction = c("v", "h", "v"),
+       main = "Attrition Correlation: OverTime over Marital Status")
+```
+
+### Looking further down the data-set
+
+```{r}
+plotDistanceHome = attritionData %>% ggplot(aes(x = DistanceFromHome, fill = Attrition)) +
+  geom_density(alpha = 0.5) +
+  xlab("Distance From Home (Miles)") +
+  ylab("Density")
+
+# Test normality - Visual aid of distribution skewness 
+plotDistanceHomeQQ = attritionData %>% ggplot(aes(x = Attrition, y = DistanceFromHome, fill = Attrition)) +
+  geom_boxplot() +
+  theme_minimal() +
+  xlab("Attrition") +
+  ylab("Distance From Home")
+
+(plotDistanceHome / plotDistanceHomeQQ)
+```
+
+## Build Classification Models
+
+### Look for imbalance
+
+We can see imbalance (a lot of No), that will push our specificity down, I tried running multiple combinations of fields
+
+```{r}
+ggplot(attritionData,
+       aes(x = OverTime, y = Age, color = Attrition)) +
+  geom_jitter(alpha = 0.6) +
+  facet_wrap( ~ JobRole) +
+  scale_color_manual(values = c("#fdae61", "#a6d96a")) +
+  ggtitle("Attrition by Overtime and Age over Job Role") +
+  xlab("Worked Overtime") +
+  ylab("Age") +
+  theme(axis.text.x = element_text(angle = 45))
+
+
+```
+
+```{r}
+
+# set.seed(3609)
+# set.seed(1686)
+# set.seed(5581)8172|6441
+# myseed = sample(i:10000, 1)
+
+set.seed(8172)
+candidate = evaluateModels(
+  k = 30,
+  threshold = 0.25,
+  target = "Attrition",
+  features = c(
+    "Age",
+    "JobRole",
+    "OverTime",
+    "MaritalStatus",
+    "JobInvolvement",
+    "TotalWorkingYears",
+    "DistanceFromHome"
+  )
+)
+
+# Picking NB
+nb_accuracy = as.numeric(candidate$nbAccuracy) * 100
+nb_sensitivity = as.numeric(candidate$nbSensitivity) * 100
+nb_specificity = as.numeric(candidate$nbSpecificity) * 100
+
+knn_accuracy = as.numeric(candidate$knnAccuracy) * 100
+knn_sensitivity = as.numeric(candidate$knnSensitivity) * 100
+knn_specificity = as.numeric(candidate$knnSpecificity) * 100
+
+results <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity"),
+  Naive_Bayes = c(nb_accuracy, nb_sensitivity, nb_specificity),
+  k_NN = c(knn_accuracy, knn_sensitivity, knn_specificity)
+)
+
+theme <- reactableTheme(
+  style = list(fontFamily = "Arial", fontSize = "14px"),
+  borderColor = "hsl(233, 9%, 22%)",
+  stripedColor = "#aeb6bf",
+)
+reactable(
+  results,
+  columns = list(
+    Metric = colDef(name = "Metric", align = "left"),
+    Naive_Bayes = colDef(
+      name = "Naive Bayes",
+      align = "center",
+      format = colFormat(digits = 2, suffix = "%")
+    ),
+    k_NN = colDef(
+      name = "k-NN",
+      align = "center",
+      format = colFormat(digits = 2, suffix = "%")
+    )
+  ),
+  theme = theme
+)
+```
+
+
+### Running our predictions
+
+#### Load Data
+```{r}
+case_one_predict = read.csv(file.choose())
+```
+
+#### Predict
+```{r}
+nb_model = candidate$naive_bayes_model
+case_one_predict$Attrition <- predict(nb_model, case_one_predict)
+
+write.csv(case_one_predict, "Case1PredictionsMiguelZavala_Attrition.csv", row.names = FALSE)
+```
+
+
+
